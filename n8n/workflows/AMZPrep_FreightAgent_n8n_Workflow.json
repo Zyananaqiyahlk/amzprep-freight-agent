@@ -1,0 +1,442 @@
+{
+  "name": "AMZ Prep — Freight Bidding Agent",
+  "nodes": [
+    {
+      "parameters": {
+        "pollTimes": {
+          "item": [{ "mode": "everyMinute" }]
+        },
+        "filters": {
+          "sender": "freight@amzprep.com",
+          "readStatus": "unread"
+        }
+      },
+      "id": "node-1",
+      "name": "📧 Gmail Trigger — Inbound RFQ",
+      "type": "n8n-nodes-base.gmailTrigger",
+      "position": [100, 300],
+      "notes": "Polls freight@amzprep.com every minute for new RFQ emails. Change pollTimes to everyMinute for beta."
+    },
+    {
+      "parameters": {
+        "model": "claude-3-5-sonnet-20241022",
+        "messages": {
+          "values": [
+            {
+              "role": "user",
+              "content": "=Extract freight shipment details from this email and return ONLY valid JSON with these exact fields:\n{\n  \"origin\": \"city, state\",\n  \"destination\": \"city, state\",\n  \"weight_lbs\": number,\n  \"dimensions\": \"LxWxH inches\",\n  \"freight_class\": \"string or null\",\n  \"hazmat\": boolean,\n  \"accessorials\": [\"list of special requirements\"],\n  \"required_pickup_date\": \"YYYY-MM-DD or null\",\n  \"customer_name\": \"string\",\n  \"customer_email\": \"string\",\n  \"special_notes\": \"string or null\"\n}\n\nEmail content:\nSubject: {{ $json.subject }}\nFrom: {{ $json.from }}\nBody: {{ $json.text }}\n\nReturn ONLY the JSON object. No explanation."
+            }
+          ]
+        }
+      },
+      "id": "node-2",
+      "name": "🤖 Claude — Extract Freight Fields",
+      "type": "n8n-nodes-base.anthropic",
+      "position": [300, 300],
+      "notes": "Claude parses the email and extracts structured freight data. Returns clean JSON for downstream processing."
+    },
+    {
+      "parameters": {
+        "jsCode": "// Parse Claude response and build freight record\nconst claudeResponse = JSON.parse($input.first().json.content[0].text);\n\n// Generate unique quote ID\nconst quoteId = 'FQ-' + Date.now();\nconst intakeTime = new Date().toISOString();\n\n// Customer carrier preference rules\n// In production, fetch from database/Google Sheet\nconst carrierRules = {\n  'default': ['Amazon Freight', 'UPS Freight', 'FedEx Freight', 'XPO Logistics', 'Old Dominion', 'Estes Express'],\n  'customer_a@example.com': ['Amazon Freight'],\n  'customer_b@example.com': ['UPS Freight', 'FedEx Freight']\n};\n\n// Customer markup rules\nconst markupRules = {\n  'default': 0.15,\n  'customer_a@example.com': 0.05,\n  'customer_b@example.com': 0.12,\n  'customer_c@example.com': 0.30\n};\n\nconst customerEmail = claudeResponse.customer_email || $node['📧 Gmail Trigger — Inbound RFQ'].json.from;\nconst carriers = carrierRules[customerEmail] || carrierRules['default'];\nconst markupPct = markupRules[customerEmail] || markupRules['default'];\n\nreturn [{\n  json: {\n    quote_id: quoteId,\n    intake_time: intakeTime,\n    status: 'INTAKE',\n    customer_email: customerEmail,\n    customer_name: claudeResponse.customer_name,\n    origin: claudeResponse.origin,\n    destination: claudeResponse.destination,\n    weight_lbs: claudeResponse.weight_lbs,\n    dimensions: claudeResponse.dimensions,\n    freight_class: claudeResponse.freight_class,\n    hazmat: claudeResponse.hazmat,\n    accessorials: JSON.stringify(claudeResponse.accessorials || []),\n    pickup_date: claudeResponse.required_pickup_date,\n    special_notes: claudeResponse.special_notes,\n    eligible_carriers: JSON.stringify(carriers),\n    markup_pct: markupPct,\n    timer_start: intakeTime,\n    bid_deadline: new Date(Date.now() + 2 * 60 * 60 * 1000).toISOString(), // 2 hours\n    rebid_deadline: null,\n    winning_carrier: null,\n    winning_rate: null,\n    sell_rate: null,\n    gross_profit: null,\n    carriers_contacted: carriers.length,\n    carriers_responded: 0,\n    original_email_id: $node['📧 Gmail Trigger — Inbound RFQ'].json.id\n  }\n}];"
+      },
+      "id": "node-3",
+      "name": "⚙️ Build Freight Record",
+      "type": "n8n-nodes-base.code",
+      "position": [500, 300],
+      "notes": "Builds the complete freight quote record. Applies carrier rules and markup rules per customer. Generates unique quote ID."
+    },
+    {
+      "parameters": {
+        "operation": "append",
+        "documentId": { "value": "YOUR_GOOGLE_SHEET_ID_HERE" },
+        "sheetName": "Freight Pipeline",
+        "columns": {
+          "mappingMode": "autoMapInputData"
+        }
+      },
+      "id": "node-4",
+      "name": "📊 Google Sheets — Log Freight Record",
+      "type": "n8n-nodes-base.googleSheets",
+      "position": [700, 200],
+      "notes": "Creates new row in Freight Pipeline tab. Replace YOUR_GOOGLE_SHEET_ID_HERE with your actual sheet ID."
+    },
+    {
+      "parameters": {
+        "resource": "deal",
+        "operation": "create",
+        "additionalFields": {
+          "dealName": "={{ $json.quote_id }} — {{ $json.origin }} to {{ $json.destination }}",
+          "stage": "INTAKE",
+          "amount": 0,
+          "closeDate": "={{ $json.pickup_date }}"
+        }
+      },
+      "id": "node-5",
+      "name": "🔗 HubSpot — Create Deal",
+      "type": "n8n-nodes-base.hubspot",
+      "position": [700, 400],
+      "notes": "Creates HubSpot deal in Freight Pipeline. Stage starts as INTAKE and progresses through the workflow."
+    },
+    {
+      "parameters": {
+        "jsCode": "// Split carriers into individual items for parallel email sending\nconst record = $input.first().json;\nconst carriers = JSON.parse(record.eligible_carriers);\n\nconst rfqTemplate = `Subject: Freight RFQ — ${record.quote_id}\n\nHello,\n\nWe have a freight shipment requiring immediate pricing. Please respond within 2 hours.\n\nQuote Reference: ${record.quote_id}\nOrigin: ${record.origin}\nDestination: ${record.destination}\nWeight: ${record.weight_lbs} lbs\nDimensions: ${record.dimensions}\nFreight Class: ${record.freight_class || 'TBD'}\nHazmat: ${record.hazmat ? 'YES — special handling required' : 'No'}\nAccessorials: ${record.accessorials}\nRequired Pickup: ${record.pickup_date || 'ASAP'}\n\nPlease reply with:\n1. Your best rate ($)\n2. Transit time (days)\n3. Any accessorial charges\n4. Availability confirmation\n\nBid deadline: ${record.bid_deadline}\nInclude reference ${record.quote_id} in your reply subject line.\n\nAMZ Prep Logistics`;\n\nreturn carriers.map(carrier => ({\n  json: {\n    ...record,\n    carrier_name: carrier,\n    rfq_email_body: rfqTemplate\n  }\n}));"
+      },
+      "id": "node-6",
+      "name": "🔀 Split — One Item Per Carrier",
+      "type": "n8n-nodes-base.code",
+      "position": [900, 300],
+      "notes": "Creates one workflow item per carrier so emails are sent in parallel. Each item contains the full RFQ template."
+    },
+    {
+      "parameters": {
+        "toList": "={{ $json.carrier_name }}@carrier-placeholder.com",
+        "subject": "=Freight RFQ — {{ $json.quote_id }} | Respond by {{ $json.bid_deadline }}",
+        "message": "={{ $json.rfq_email_body }}",
+        "options": {
+          "replyTo": "freight@amzprep.com"
+        }
+      },
+      "id": "node-7",
+      "name": "📤 Gmail — Send RFQ to Carriers",
+      "type": "n8n-nodes-base.gmail",
+      "position": [1100, 300],
+      "notes": "Sends RFQ to each carrier simultaneously. Replace carrier emails with actual carrier email addresses. Include quote_id in subject for reply tracking."
+    },
+    {
+      "parameters": {
+        "pollTimes": {
+          "item": [{ "mode": "everyMinute" }]
+        },
+        "filters": {
+          "subject": "FQ-"
+        }
+      },
+      "id": "node-8",
+      "name": "📧 Gmail — Poll Carrier Responses",
+      "type": "n8n-nodes-base.gmailTrigger",
+      "position": [100, 600],
+      "notes": "Separate trigger workflow. Polls for emails containing FQ- in subject (quote ID). This is the rate collection workflow."
+    },
+    {
+      "parameters": {
+        "model": "claude-3-5-sonnet-20241022",
+        "messages": {
+          "values": [
+            {
+              "role": "user",
+              "content": "=Extract freight rate details from this carrier response email and return ONLY valid JSON:\n{\n  \"quote_id\": \"extract FQ-XXXXXXXX from subject line\",\n  \"carrier_name\": \"sender company name\",\n  \"rate_usd\": number,\n  \"transit_days\": number,\n  \"accessorial_charges\": number,\n  \"total_rate\": number,\n  \"availability_confirmed\": boolean,\n  \"notes\": \"any special conditions\"\n}\n\nEmail:\nSubject: {{ $json.subject }}\nFrom: {{ $json.from }}\nBody: {{ $json.text }}\n\nReturn ONLY the JSON. No explanation."
+            }
+          ]
+        }
+      },
+      "id": "node-9",
+      "name": "🤖 Claude — Parse Carrier Rate",
+      "type": "n8n-nodes-base.anthropic",
+      "position": [300, 600],
+      "notes": "Claude extracts structured rate data from each carrier email response. Handles various email formats and writing styles."
+    },
+    {
+      "parameters": {
+        "operation": "append",
+        "documentId": { "value": "YOUR_GOOGLE_SHEET_ID_HERE" },
+        "sheetName": "Rate Responses",
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "quote_id": "={{ JSON.parse($node['🤖 Claude — Parse Carrier Rate'].json.content[0].text).quote_id }}",
+            "carrier_name": "={{ JSON.parse($node['🤖 Claude — Parse Carrier Rate'].json.content[0].text).carrier_name }}",
+            "rate_usd": "={{ JSON.parse($node['🤖 Claude — Parse Carrier Rate'].json.content[0].text).rate_usd }}",
+            "transit_days": "={{ JSON.parse($node['🤖 Claude — Parse Carrier Rate'].json.content[0].text).transit_days }}",
+            "total_rate": "={{ JSON.parse($node['🤖 Claude — Parse Carrier Rate'].json.content[0].text).total_rate }}",
+            "response_timestamp": "={{ new Date().toISOString() }}",
+            "round": "1"
+          }
+        }
+      },
+      "id": "node-10",
+      "name": "📊 Sheets — Log Rate Response",
+      "type": "n8n-nodes-base.googleSheets",
+      "position": [500, 600],
+      "notes": "Logs each carrier rate response with timestamp. Round 1 = initial bid. Round 2 = re-bid responses."
+    },
+    {
+      "parameters": {
+        "jsCode": "// Check if all carriers responded or 2-hour timer expired\n// In production: query Google Sheets for this quote_id\n// For beta: simplified check based on response count\n\nconst quoteId = JSON.parse($input.first().json.content[0].text).quote_id;\n\n// Simulate: in production fetch from Sheets\nconst carriersContacted = 6;\nconst carriersResponded = 4; // fetch real count from Sheets\nconst bidDeadline = new Date(Date.now() - 1000); // simulate expired for demo\nconst timerExpired = new Date() > bidDeadline;\n\nconst shouldTriggerRebid = timerExpired || (carriersResponded >= carriersContacted);\n\nreturn [{ json: { should_trigger_rebid: shouldTriggerRebid, quote_id: quoteId } }];"
+      },
+      "id": "node-11",
+      "name": "⏱️ Check Timer / Response Count",
+      "type": "n8n-nodes-base.code",
+      "position": [700, 600],
+      "notes": "Checks if 2-hour bidding window has expired OR all carriers have responded. Either condition triggers the re-bid round."
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true },
+          "conditions": [
+            {
+              "leftValue": "={{ $json.should_trigger_rebid }}",
+              "rightValue": true,
+              "operator": { "type": "boolean", "operation": "true" }
+            }
+          ]
+        }
+      },
+      "id": "node-12",
+      "name": "🔀 IF — Trigger Re-Bid?",
+      "type": "n8n-nodes-base.if",
+      "position": [900, 600],
+      "notes": "Routes to re-bid engine if timer expired or all carriers responded. Otherwise waits for more responses."
+    },
+    {
+      "parameters": {
+        "jsCode": "// Find lowest rate from responses and build re-bid message\n// In production: query Google Sheets Rate Responses tab\n\n// Simulated rate comparison (replace with actual Sheets lookup)\nconst rates = [\n  { carrier: 'Amazon Freight', rate: 950 },\n  { carrier: 'UPS Freight', rate: 1100 },\n  { carrier: 'FedEx Freight', rate: 875 },\n  { carrier: 'XPO Logistics', rate: 990 }\n];\n\nconst winner = rates.reduce((min, r) => r.rate < min.rate ? r : min);\nconst losers = rates.filter(r => r.carrier !== winner.carrier);\n\nconst rebidMessage = `Re-Bid Request — Final Round\n\nThank you for your quote on ${$json.quote_id}.\n\nWe have received a competitive rate of $${winner.rate} for this shipment.\n\nThis is your opportunity to submit a final best rate.\n\nDeadline: 30 minutes from receipt of this email.\n\nPlease reply with your absolute best rate.\nInclude ${$json.quote_id} in your subject line.\n\nAMZ Prep Logistics`;\n\nreturn losers.map(carrier => ({\n  json: {\n    quote_id: $json.quote_id,\n    carrier_name: carrier.carrier,\n    current_lowest: winner.rate,\n    winning_carrier_temp: winner.carrier,\n    rebid_message: rebidMessage,\n    rebid_deadline: new Date(Date.now() + 30 * 60 * 1000).toISOString()\n  }\n}));"
+      },
+      "id": "node-13",
+      "name": "🏆 Re-Bid Engine — Find Lowest + Build Message",
+      "type": "n8n-nodes-base.code",
+      "position": [1100, 500],
+      "notes": "Identifies lowest rate from first round. Sends re-bid email to all non-winning carriers. 30-minute final window."
+    },
+    {
+      "parameters": {
+        "toList": "={{ $json.carrier_name }}@carrier-placeholder.com",
+        "subject": "=🔄 FINAL ROUND — {{ $json.quote_id }} | 30 Min Deadline",
+        "message": "={{ $json.rebid_message }}"
+      },
+      "id": "node-14",
+      "name": "📤 Gmail — Send Re-Bid to Carriers",
+      "type": "n8n-nodes-base.gmail",
+      "position": [1300, 500],
+      "notes": "Sends urgent re-bid email to non-winning carriers. Subject line flags urgency. 30-minute response window."
+    },
+    {
+      "parameters": {
+        "jsCode": "// After re-bid window closes — select final winner\n// Apply customer markup — calculate sell rate and margin\n\n// Simulated final rates (replace with Sheets lookup)\nconst finalRates = [\n  { carrier: 'FedEx Freight', rate: 875 }, // original winner\n  { carrier: 'Amazon Freight', rate: 820 }, // re-bid came in lower\n  { carrier: 'XPO Logistics', rate: 900 }\n];\n\nconst winner = finalRates.reduce((min, r) => r.rate < min.rate ? r : min);\n\n// Customer markup (fetched from freight record)\nconst markupPct = 0.15; // 15% default — replace with actual from record\nconst sellRate = Math.ceil(winner.rate * (1 + markupPct));\nconst grossProfit = sellRate - winner.rate;\nconst grossProfitPct = ((grossProfit / sellRate) * 100).toFixed(1);\n\nreturn [{\n  json: {\n    quote_id: $json.quote_id,\n    winning_carrier: winner.carrier,\n    carrier_rate: winner.rate,\n    markup_pct: markupPct,\n    sell_rate: sellRate,\n    gross_profit_usd: grossProfit,\n    gross_profit_pct: parseFloat(grossProfitPct),\n    quote_expiry: new Date(Date.now() + 4 * 60 * 60 * 1000).toISOString()\n  }\n}];"
+      },
+      "id": "node-15",
+      "name": "💰 Markup Engine — Calculate Sell Rate",
+      "type": "n8n-nodes-base.code",
+      "position": [1100, 700],
+      "notes": "Selects final winning carrier after re-bid. Applies customer-specific markup rules. Calculates sell rate, gross profit $ and %."
+    },
+    {
+      "parameters": {
+        "model": "claude-3-5-sonnet-20241022",
+        "messages": {
+          "values": [
+            {
+              "role": "user",
+              "content": "=Generate a professional freight quote email for a logistics company. Return ONLY the email body text.\n\nDetails:\n- Quote ID: {{ $json.quote_id }}\n- Origin: [ORIGIN from record]\n- Destination: [DESTINATION from record]\n- Your Rate: ${{ $json.sell_rate }}\n- Carrier: {{ $json.winning_carrier }}\n- Transit Time: 3-5 business days\n- Quote Expires: {{ $json.quote_expiry }}\n\nTone: Professional, confident, brief. Include all key details. End with clear call to action to approve or discuss.\nDo NOT reveal our carrier cost or markup."
+            }
+          ]
+        }
+      },
+      "id": "node-16",
+      "name": "🤖 Claude — Generate Customer Quote Email",
+      "type": "n8n-nodes-base.anthropic",
+      "position": [1300, 700],
+      "notes": "Claude writes a professional quote email. Does not reveal internal carrier cost or markup percentage."
+    },
+    {
+      "parameters": {
+        "toList": "={{ $json.customer_email }}",
+        "subject": "=Freight Quote {{ $json.quote_id }} — ${{ $json.sell_rate }} | Valid 4 Hours",
+        "message": "={{ $node['🤖 Claude — Generate Customer Quote Email'].json.content[0].text }}"
+      },
+      "id": "node-17",
+      "name": "📤 Gmail — Send Quote to Customer",
+      "type": "n8n-nodes-base.gmail",
+      "position": [1500, 700],
+      "notes": "Sends final quote to customer. Quote expires in 4 hours. Subject line shows price upfront for fast decision-making."
+    },
+    {
+      "parameters": {
+        "pollTimes": {
+          "item": [{ "mode": "everyMinute" }]
+        },
+        "filters": {
+          "subject": "FQ-"
+        }
+      },
+      "id": "node-18",
+      "name": "📧 Gmail — Poll Customer Response",
+      "type": "n8n-nodes-base.gmailTrigger",
+      "position": [100, 900],
+      "notes": "Third trigger workflow. Polls for customer approval or rejection. Separate from carrier response polling."
+    },
+    {
+      "parameters": {
+        "model": "claude-3-5-sonnet-20241022",
+        "messages": {
+          "values": [
+            {
+              "role": "user",
+              "content": "=Classify this customer email response to a freight quote as one of: APPROVED, REJECTED, NEGOTIATING, UNCLEAR\n\nReturn ONLY valid JSON:\n{\n  \"classification\": \"APPROVED|REJECTED|NEGOTIATING|UNCLEAR\",\n  \"lost_reason\": \"if REJECTED: price_too_high|used_competitor|shipment_cancelled|other\",\n  \"competitor_rate\": number or null,\n  \"notes\": \"any relevant context\"\n}\n\nEmail:\nSubject: {{ $json.subject }}\nBody: {{ $json.text }}\n\nReturn ONLY the JSON."
+            }
+          ]
+        }
+      },
+      "id": "node-19",
+      "name": "🤖 Claude — Classify Customer Response",
+      "type": "n8n-nodes-base.anthropic",
+      "position": [300, 900],
+      "notes": "Claude classifies customer response as APPROVED, REJECTED, NEGOTIATING, or UNCLEAR. Also extracts lost reason and competitor rate if rejected."
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            { "outputKey": "approved", "conditions": { "options": {}, "conditions": [{ "leftValue": "={{ JSON.parse($json.content[0].text).classification }}", "rightValue": "APPROVED", "operator": { "type": "string", "operation": "equals" } }] } },
+            { "outputKey": "rejected", "conditions": { "options": {}, "conditions": [{ "leftValue": "={{ JSON.parse($json.content[0].text).classification }}", "rightValue": "REJECTED", "operator": { "type": "string", "operation": "equals" } }] } }
+          ]
+        }
+      },
+      "id": "node-20",
+      "name": "🔀 Switch — WIN or LOSS",
+      "type": "n8n-nodes-base.switch",
+      "position": [500, 900],
+      "notes": "Routes to WIN branch (approved) or LOSS branch (rejected). NEGOTIATING routes back for manual review."
+    },
+    {
+      "parameters": {
+        "toList": "={{ $json.winning_carrier }}@carrier-placeholder.com",
+        "subject": "=✅ PROCEED — {{ $json.quote_id }} | Customer Approved",
+        "message": "=The customer has approved the shipment for quote {{ $json.quote_id }}.\n\nPlease proceed with the booking and send the Bill of Lading (BOL) to freight@amzprep.com.\n\nReference all communications with: {{ $json.quote_id }}\n\nThank you,\nAMZ Prep Logistics"
+      },
+      "id": "node-21",
+      "name": "📤 WIN — Notify Carrier to Proceed",
+      "type": "n8n-nodes-base.gmail",
+      "position": [700, 800],
+      "notes": "WIN BRANCH: Immediately notifies winning carrier that shipment is approved. Requests BOL."
+    },
+    {
+      "parameters": {
+        "operation": "update",
+        "documentId": { "value": "YOUR_GOOGLE_SHEET_ID_HERE" },
+        "sheetName": "Freight Pipeline",
+        "filtersUI": { "values": [{ "lookupColumn": "quote_id", "lookupValue": "={{ $json.quote_id }}" }] },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "status": "APPROVED",
+            "approval_time": "={{ new Date().toISOString() }}",
+            "winning_carrier": "={{ $json.winning_carrier }}",
+            "carrier_rate": "={{ $json.carrier_rate }}",
+            "sell_rate": "={{ $json.sell_rate }}",
+            "gross_profit_usd": "={{ $json.gross_profit_usd }}",
+            "gross_profit_pct": "={{ $json.gross_profit_pct }}"
+          }
+        }
+      },
+      "id": "node-22",
+      "name": "📊 WIN — Update Sheets to APPROVED",
+      "type": "n8n-nodes-base.googleSheets",
+      "position": [700, 860],
+      "notes": "WIN BRANCH: Updates Google Sheet with final carrier, rates, margin data, and approval timestamp."
+    },
+    {
+      "parameters": {
+        "operation": "update",
+        "documentId": { "value": "YOUR_GOOGLE_SHEET_ID_HERE" },
+        "sheetName": "Freight Pipeline",
+        "filtersUI": { "values": [{ "lookupColumn": "quote_id", "lookupValue": "={{ $json.quote_id }}" }] },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "status": "LOST",
+            "lost_time": "={{ new Date().toISOString() }}",
+            "lost_reason": "={{ JSON.parse($node['🤖 Claude — Classify Customer Response'].json.content[0].text).lost_reason }}",
+            "competitor_rate": "={{ JSON.parse($node['🤖 Claude — Classify Customer Response'].json.content[0].text).competitor_rate }}"
+          }
+        }
+      },
+      "id": "node-23",
+      "name": "📊 LOSS — Log Lost Reason + Competitor Rate",
+      "type": "n8n-nodes-base.googleSheets",
+      "position": [700, 1000],
+      "notes": "LOSS BRANCH: Logs lost reason (price/competitor/cancelled) and competitor rate for analytics. Feeds carrier competitiveness scoring."
+    },
+    {
+      "parameters": {
+        "toList": "={{ $json.winning_carrier }}@carrier-placeholder.com",
+        "subject": "=❌ CANCELLED — {{ $json.quote_id }} | Do Not Proceed",
+        "message": "=Unfortunately the customer has declined this shipment for quote {{ $json.quote_id }}.\n\nPlease do not proceed with booking.\n\nWe appreciate your competitive pricing and will keep you in mind for future shipments.\n\nAMZ Prep Logistics"
+      },
+      "id": "node-24",
+      "name": "📤 LOSS — Notify Carrier Cancelled",
+      "type": "n8n-nodes-base.gmail",
+      "position": [900, 1000],
+      "notes": "LOSS BRANCH: Notifies winning carrier that shipment was not approved. Maintains carrier relationship."
+    }
+  ],
+  "connections": {
+    "📧 Gmail Trigger — Inbound RFQ": { "main": [[{ "node": "🤖 Claude — Extract Freight Fields", "type": "main", "index": 0 }]] },
+    "🤖 Claude — Extract Freight Fields": { "main": [[{ "node": "⚙️ Build Freight Record", "type": "main", "index": 0 }]] },
+    "⚙️ Build Freight Record": {
+      "main": [[
+        { "node": "📊 Google Sheets — Log Freight Record", "type": "main", "index": 0 },
+        { "node": "🔗 HubSpot — Create Deal", "type": "main", "index": 0 },
+        { "node": "🔀 Split — One Item Per Carrier", "type": "main", "index": 0 }
+      ]]
+    },
+    "🔀 Split — One Item Per Carrier": { "main": [[{ "node": "📤 Gmail — Send RFQ to Carriers", "type": "main", "index": 0 }]] },
+    "📧 Gmail — Poll Carrier Responses": { "main": [[{ "node": "🤖 Claude — Parse Carrier Rate", "type": "main", "index": 0 }]] },
+    "🤖 Claude — Parse Carrier Rate": { "main": [[{ "node": "📊 Sheets — Log Rate Response", "type": "main", "index": 0 }]] },
+    "📊 Sheets — Log Rate Response": { "main": [[{ "node": "⏱️ Check Timer / Response Count", "type": "main", "index": 0 }]] },
+    "⏱️ Check Timer / Response Count": { "main": [[{ "node": "🔀 IF — Trigger Re-Bid?", "type": "main", "index": 0 }]] },
+    "🔀 IF — Trigger Re-Bid?": {
+      "main": [
+        [{ "node": "🏆 Re-Bid Engine — Find Lowest + Build Message", "type": "main", "index": 0 }],
+        []
+      ]
+    },
+    "🏆 Re-Bid Engine — Find Lowest + Build Message": { "main": [[{ "node": "📤 Gmail — Send Re-Bid to Carriers", "type": "main", "index": 0 }]] },
+    "📤 Gmail — Send Re-Bid to Carriers": { "main": [[{ "node": "💰 Markup Engine — Calculate Sell Rate", "type": "main", "index": 0 }]] },
+    "💰 Markup Engine — Calculate Sell Rate": { "main": [[{ "node": "🤖 Claude — Generate Customer Quote Email", "type": "main", "index": 0 }]] },
+    "🤖 Claude — Generate Customer Quote Email": { "main": [[{ "node": "📤 Gmail — Send Quote to Customer", "type": "main", "index": 0 }]] },
+    "📧 Gmail — Poll Customer Response": { "main": [[{ "node": "🤖 Claude — Classify Customer Response", "type": "main", "index": 0 }]] },
+    "🤖 Claude — Classify Customer Response": { "main": [[{ "node": "🔀 Switch — WIN or LOSS", "type": "main", "index": 0 }]] },
+    "🔀 Switch — WIN or LOSS": {
+      "main": [
+        [
+          { "node": "📤 WIN — Notify Carrier to Proceed", "type": "main", "index": 0 },
+          { "node": "📊 WIN — Update Sheets to APPROVED", "type": "main", "index": 0 }
+        ],
+        [
+          { "node": "📊 LOSS — Log Lost Reason + Competitor Rate", "type": "main", "index": 0 },
+          { "node": "📤 LOSS — Notify Carrier Cancelled", "type": "main", "index": 0 }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "meta": {
+    "instanceId": "amzprep-freight-agent-v1",
+    "templateCredsSetupCompleted": false
+  },
+  "_readme": {
+    "title": "AMZ Prep Freight Bidding Agent",
+    "author": "Naqiyah Lakdawala — zyanacosystems.com",
+    "version": "1.0 Beta",
+    "description": "Automated freight quoting engine. Replaces manual 3-24 hour process with sub-30-minute automated bidding.",
+    "setup_required": [
+      "1. Replace YOUR_GOOGLE_SHEET_ID_HERE with your actual Google Sheet ID",
+      "2. Configure Gmail credentials for freight@amzprep.com",
+      "3. Add HubSpot API credentials",
+      "4. Add Anthropic/Claude API key",
+      "5. Update carrier email addresses in node-7 (Send RFQ to Carriers)",
+      "6. Update carrier preference rules in node-3 (Build Freight Record)",
+      "7. Update customer markup rules in node-3 (Build Freight Record)",
+      "8. Create Google Sheet with tabs: Freight Pipeline, Rate Responses, Analytics",
+      "9. Test with a sample RFQ email before going live"
+    ],
+    "workflows": [
+      "Workflow 1 (Intake): Nodes 1-7 — handles inbound RFQ to carrier distribution",
+      "Workflow 2 (Rate Collection): Nodes 8-14 — handles carrier responses and re-bid",
+      "Workflow 3 (Quote + Approval): Nodes 15-24 — handles customer quote and approval branching"
+    ]
+  }
+}
