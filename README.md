@@ -23,41 +23,8 @@ The current workflow:
 
 ## How It Works
 
-```
-Customer Email (freight@amzprep.com)
-          │
-          ▼
-    Intake Service
-  Claude extracts fields
-  Creates pipeline record
-          │
-          ▼
-  Carrier Distribution
-  RFQ sent to 5-6 carriers
-  2-hour bidding window starts
-          │
-          ▼
-  Rate Collection Engine
-  Claude parses each response
-  Rates logged to Google Sheets
-          │
-          ▼
-    Re-Bid Engine
-  Identifies lowest rate
-  Sends best-and-final (30 min)
-          │
-          ▼
-  Markup + Quote Engine
-  Applies customer-specific rules
-  Claude generates quote email
-          │
-      ┌───┴───┐
-    WIN      LOSS
-      │         │
-  Carrier    Log reason
-  notified   + competitor
-  PandaDoc   rate stored
-  invoice
+<img width="1350" height="1946" alt="image" src="https://github.com/user-attachments/assets/c734d50e-964b-44b6-86bc-c2860cf3ad5c" />
+
 ```
 
 **Target:** Response time from 3–24 hours → under 30 minutes.
